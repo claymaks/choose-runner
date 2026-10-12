@@ -1,0 +1,102 @@
+name: Choose runner
+
+on:
+  workflow_call:
+    inputs:
+      order:
+        description: >-
+          Comma-separated runner labels, most preferred first. The first
+          label with an online runner wins.
+        type: string
+        default: persephone,hestia
+      fallback:
+        description: >-
+          runs-on value when no listed label is online (a label, or a JSON
+          array of labels).
+        type: string
+        default: ubuntu-latest
+      extra_labels:
+        description: >-
+          Comma-separated labels the self-hosted runner must also carry;
+          they are added to the chosen runs-on.
+        type: string
+        default: dind
+    secrets:
+      RUNNER_STATUS_PAT:
+        description: >-
+          PAT with Administration:read on the calling repo (GITHUB_TOKEN
+          cannot list self-hosted runners).
+        required: false
+    outputs:
+      runner:
+        description: >-
+          JSON for runs-on, e.g. ["self-hosted","persephone","dind"] or
+          "ubuntu-latest". Use with fromJSON().
+        value: ${{ jobs.choose.outputs.runner }}
+
+permissions: {}
+
+jobs:
+  choose:
+    name: Choose
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - name: Pick runner
+        id: pick
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_STATUS_PAT }}
+          REPO: ${{ github.repository }}
+          ORDER: ${{ inputs.order }}
+          FALLBACK: ${{ inputs.fallback }}
+          EXTRA: ${{ inputs.extra_labels }}
+        run: |
+          # Match by LABEL, not name: ephemeral runners get a new random
+          # name every job.
+          split() { jq -cn --arg s "$1" \
+            '$s | split(",") | map(gsub("^\\s+|\\s+$"; "")
+              | select(length > 0))'; }
+          extra=$(split "$EXTRA")
+
+          runners='[]'
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::RUNNER_STATUS_PAT not set; using fallback"
+          elif ! runners=$(gh api --paginate \
+              "repos/$REPO/actions/runners?per_page=100" \
+              --jq '.runners[]' | jq -cs .); then
+            echo "::warning::could not list runners; using fallback"
+            runners='[]'
+          fi
+
+          runner=''
+          for label in $(split "$ORDER" | jq -r '.[]'); do
+            want=$(jq -cn --arg l "$label" --argjson x "$extra" \
+              '[$l] + $x | unique')
+            online=$(jq --argjson want "$want" \
+              '[.[] | select(.status == "online")
+                    | select([.labels[].name] as $have
+                             | $want - $have | length == 0)]
+               | length' <<<"$runners")
+            echo "Online '$label' runners (with $want): $online"
+            if [ "$online" -ge 1 ]; then
+              runner=$(jq -cn --arg l "$label" --argjson x "$extra" \
+                '["self-hosted", $l] + $x')
+              break
+            fi
+          done
+
+          if [ -z "$runner" ]; then
+            if jq -e . >/dev/null 2>&1 <<<"$FALLBACK" \
+                && [ "${FALLBACK:0:1}" = "[" ]; then
+              runner=$(jq -c . <<<"$FALLBACK")
+            else
+              runner=$(jq -cn --arg f "$FALLBACK" '$f')
+            fi
+          fi
+
+          echo "Chosen runner: $runner"
+          echo "runner=$runner" >> "$GITHUB_OUTPUT"
+          echo "Runner: \`$runner\`" >> "$GITHUB_STEP_SUMMARY"
